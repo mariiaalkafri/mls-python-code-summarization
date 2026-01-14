@@ -1,9 +1,9 @@
-
 import os
 import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
 
 class EarlyStopping:
     def __init__(self, patience=4, min_delta=0.001):
@@ -40,6 +40,13 @@ def save_checkpoint(path, model, optimizer, epoch, val_loss, best_val):
     torch.save(state, path)
 
 
+def _get(batch, key):
+    """Support dict batches and object batches."""
+    if isinstance(batch, dict):
+        return batch.get(key, None)
+    return getattr(batch, key, None)
+
+
 def run_epoch(
     model, dataloader, optimizer, criterion, device,
     train=True, clip_grad=1.0, log_every=200, pad_id=0,
@@ -52,54 +59,79 @@ def run_epoch(
     total_tokens = 0
 
     start = time.time()
-    # Check if Scaler is active and device is CUDA 
-    use_amp = (scaler is not None) and (device == "cuda")
+
+    # ✅ AMP works for "cuda" and "cuda:0"
+    use_amp = (scaler is not None) and str(device).startswith("cuda")
 
     for i, batch in enumerate(dataloader):
-        # Batch object from Collator
-        src_ids = batch.src_ids.to(device, non_blocking=True)
-        src_mask = batch.src_mask.to(device, non_blocking=True)
-        tgt_ids = batch.tgt_ids.to(device, non_blocking=True)
+        # Required keys
+        src_ids  = _get(batch, "src_ids")
+        src_mask = _get(batch, "src_mask")
 
-        tgt_in = tgt_ids[:, :-1]
-        tgt_out = tgt_ids[:, 1:]
+        if src_ids is None or src_mask is None:
+            raise KeyError(
+                "Batch must contain 'src_ids' and 'src_mask'. "
+                f"Got keys: {list(batch.keys()) if isinstance(batch, dict) else dir(batch)}"
+            )
+
+        src_ids  = src_ids.to(device, non_blocking=True)
+        src_mask = src_mask.to(device, non_blocking=True)
+
+        # Two possible target formats:
+        tgt_ids = _get(batch, "tgt_ids")   # Format A
+        tgt_in  = _get(batch, "tgt_in")    # Format B
+        labels  = _get(batch, "labels")    # Format B
+
+        if tgt_ids is not None:
+            tgt_ids = tgt_ids.to(device, non_blocking=True)
+            tgt_in = tgt_ids[:, :-1]
+            labels = tgt_ids[:, 1:]
+        else:
+            if tgt_in is None or labels is None:
+                raise KeyError(
+                    "Batch must contain either 'tgt_ids' OR ('tgt_in' and 'labels'). "
+                    f"Got keys: {list(batch.keys()) if isinstance(batch, dict) else dir(batch)}"
+                )
+            tgt_in  = tgt_in.to(device, non_blocking=True)
+            labels  = labels.to(device, non_blocking=True)
 
         if train:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                logits = model(src_ids, src_mask, tgt_in)
+                loss = criterion(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1),
+                )
 
             if use_amp:
-                with torch.cuda.amp.autocast():
-                    logits = model(src_ids, src_mask, tgt_in)
-                    loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
-
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                logits = model(src_ids, src_mask, tgt_in)
-                loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
                 optimizer.step()
 
         else:
             with torch.no_grad():
-                if use_amp:
-                    with torch.cuda.amp.autocast():
-                        logits = model(src_ids, src_mask, tgt_in)
-                        loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
-                else:
+                with torch.amp.autocast(device_type="cuda", enabled=use_amp):
                     logits = model(src_ids, src_mask, tgt_in)
-                    loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+                    loss = criterion(
+                        logits.reshape(-1, logits.size(-1)),
+                        labels.reshape(-1),
+                    )
 
-        total_loss += loss.item()
+        total_loss += float(loss.item())
 
+        # ✅ token accuracy ignoring PAD
         with torch.no_grad():
             preds = logits.argmax(dim=-1)
-            mask = tgt_out.ne(pad_id)
-            total_correct += (preds.eq(tgt_out) & mask).sum().item()
+            mask = labels.ne(pad_id)
+            total_correct += (preds.eq(labels) & mask).sum().item()
             total_tokens += mask.sum().item()
 
         if train and (i % log_every == 0):
@@ -124,17 +156,17 @@ def train_model(
     )
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id, label_smoothing=0.1)
-
     early_stopping = EarlyStopping(patience=4, min_delta=0.001)
     os.makedirs(save_dir, exist_ok=True)
 
     start_epoch = 1
     best_val = float("inf")
 
-    # Only enable scaler if using CUDA
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+    # ✅ Fix AMP deprecation + enable for cuda:0 too
+    use_amp = str(device).startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    # Checkpoint Resume
+    # Resume
     if resume_path is not None and os.path.exists(resume_path):
         print(f"Resuming from checkpoint: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
@@ -166,7 +198,6 @@ def train_model(
         )
 
         elapsed = time.time() - start_time
-
         print(f"\nEpoch {epoch} | Time: {elapsed:.2f}s")
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
         print(f"   Val Loss: {val_loss:.4f} |   Val Acc: {val_acc:.2f}%")
