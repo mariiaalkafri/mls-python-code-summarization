@@ -1,4 +1,3 @@
-
 import os
 import sys
 import random
@@ -7,6 +6,7 @@ from typing import List, Dict, Tuple
 import torch
 from torch.utils.data import DataLoader
 
+# Ensure src can be found
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.data import JsonlCodeSummaryDataset, Collator
@@ -84,12 +84,12 @@ def pick_2d_stratified_subset(
 
 
 def main():
-    # Update paths to match local environment structure
+    # --- Config ---
     tokenizer_path = "data/tokenizer/tokenizer.json"
     train_path = "data/processed/codesearchnet_clean/train.jsonl"
-    val_path   = "data/processed/codesearchnet_clean/train.jsonl" # Using train as validation for demo structure if valid not present, but user has valid
+    val_path   = "data/processed/codesearchnet_clean/train.jsonl"
 
-    # Check for validation file existence
+    # Auto-detect validation file
     possible_val = "data/processed/codesearchnet_clean/validation.jsonl"
     if os.path.exists(possible_val):
         val_path = possible_val
@@ -104,13 +104,14 @@ def main():
     lr = 1e-4
     weight_decay = 0.01
     clip_grad = 1.0
-    log_every = 100 # Adjusted for smaller feel
+    log_every = 200
 
     SUBSET_TRAIN = 50_000
     SUBSET_VAL = 8_000
     SEED = 42
 
-    SAVE_DIR = "models/"
+    # --- GOOGLE DRIVE PATH ---
+    SAVE_DIR = "/content/drive/MyDrive/ml-python-code-summarization/models_transformer_fromscratch"
     RESUME_PATH = f"{SAVE_DIR}/last.pt"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -133,6 +134,7 @@ def main():
     print(f"Full val examples:   {len(val_dataset)}")
 
     # Stratified Sampling
+    print("Selecting stratified subsets...")
     train_subset, _ = pick_2d_stratified_subset(train_dataset.examples, min(SUBSET_TRAIN, len(train_dataset)), seed=SEED)
     val_subset, _ = pick_2d_stratified_subset(val_dataset.examples, min(SUBSET_VAL, len(val_dataset)), seed=SEED)
     train_dataset.examples = train_subset
@@ -145,7 +147,7 @@ def main():
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collator,
-        num_workers=0, # Windows stability
+        num_workers=2,  # Safe on Colab (Linux) for speed
         pin_memory=True
     )
     val_loader = DataLoader(
@@ -153,7 +155,7 @@ def main():
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collator,
-        num_workers=0, # Windows stability
+        num_workers=2,  # Safe on Colab (Linux) for speed
         pin_memory=True
     )
 
@@ -169,7 +171,7 @@ def main():
         pad_id=pad_id
     ).to(device)
 
-    print("Starting training (resume if checkpoint exists)...")
+    print("Starting training...")
     train_model(
         model=model,
         train_loader=train_loader,
