@@ -1,0 +1,13 @@
+# Data
+data/
+*.jsonl
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+.env
+venv/
+.ipynb_checkpoints/
